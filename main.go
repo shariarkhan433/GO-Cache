@@ -6,19 +6,50 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Cache struct {
-	mu   sync.RWMutex      //the lock ?
-	data map[string]string //the hash map
+	mu      sync.RWMutex
+	data    map[string]string
+	expires map[string]int64
 }
 
 var store = Cache{
-	data: make(map[string]string),
+	data:    make(map[string]string),
+	expires: make(map[string]int64),
 }
 
+// FIX 1: Make 'aof' global so handleConnection can see it
+var aof *AOF
+
 func main() {
-	//Listen on a TCP port (socket programming)
+	var err error
+	// Initialize the global 'aof' variable
+	aof, err = NewAOF("database.aof")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer aof.Close()
+
+	// FIX 3: Update Replay Logic to handle deletions
+	aof.Read(func(value []string) {
+		command := strings.ToUpper(value[0])
+
+		if command == "SET" {
+			key, val := value[1], value[2]
+			store.mu.Lock()
+			store.data[key] = val
+			store.mu.Unlock()
+		} else if command == "DEL" {
+			key := value[1]
+			store.mu.Lock()
+			delete(store.data, key)
+			store.mu.Unlock()
+		}
+	})
+
 	listener, err := net.Listen("tcp", ":6379")
 	if err != nil {
 		fmt.Println(err)
@@ -28,14 +59,14 @@ func main() {
 
 	fmt.Println("Listener on port :6379")
 
+	go startJanitor()
+
 	for {
-		//Accepting new connection
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println(err)
 			continue
 		}
-		//handling concurrency
 		go handleConnection(conn)
 	}
 }
@@ -45,10 +76,8 @@ func handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 
 	for {
-		// USE THE NEW PARSER HERE
 		parts, err := parseRESP(reader)
 		if err != nil {
-			// If error is EOF, client disconnected
 			return
 		}
 
@@ -57,7 +86,7 @@ func handleConnection(conn net.Conn) {
 		}
 
 		command := strings.ToUpper(parts[0])
-		fmt.Printf("Processing command: %v\n", parts) // Debug print
+		// fmt.Printf("Processing command: %v\n", parts)
 
 		switch command {
 		case "PING":
@@ -74,6 +103,8 @@ func handleConnection(conn net.Conn) {
 			store.data[key] = value
 			store.mu.Unlock()
 
+			// Write to AOF
+			aof.Write("SET", key, value)
 			conn.Write([]byte("+OK\r\n"))
 
 		case "GET":
@@ -83,9 +114,18 @@ func handleConnection(conn net.Conn) {
 			}
 			key := parts[1]
 
-			store.mu.RLock()
+			store.mu.Lock()
+			exp, hasExpiry := store.expires[key]
+			if hasExpiry && time.Now().Unix() > exp {
+				delete(store.data, key)
+				delete(store.expires, key)
+				store.mu.Unlock()
+				conn.Write([]byte("$-1\r\n"))
+				continue
+			}
+
 			val, ok := store.data[key]
-			store.mu.RUnlock()
+			store.mu.Unlock()
 
 			if !ok {
 				conn.Write([]byte("$-1\r\n"))
@@ -94,7 +134,39 @@ func handleConnection(conn net.Conn) {
 				conn.Write([]byte(resp))
 			}
 
-		// Handle the initial "COMMAND" check from redis-cli
+		case "EXPIRE":
+			if len(parts) < 3 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'expire' command\r\n"))
+				continue
+			}
+			key := parts[1]
+			secondsStr := parts[2]
+
+			var seconds int64
+			fmt.Sscanf(secondsStr, "%d", &seconds)
+
+			store.mu.Lock()
+			store.expires[key] = time.Now().Unix() + seconds
+			store.mu.Unlock()
+
+			conn.Write([]byte(":1\r\n"))
+
+		case "DEL":
+			// FIX 2: Implement the DEL logic completely
+			if len(parts) < 2 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'del' command\r\n"))
+				continue
+			}
+			key := parts[1]
+
+			store.mu.Lock()
+			delete(store.data, key)
+			store.mu.Unlock()
+
+			// Write to AOF
+			aof.Write("DEL", key)
+			conn.Write([]byte(":1\r\n")) // Redis returns integer 1 for success
+
 		case "COMMAND":
 			conn.Write([]byte("+OK\r\n"))
 
@@ -104,6 +176,8 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// ... [Keep your helper functions parseRESP and readLine here] ...
+// ... [Keep startJanitor here] ...
 // Helper to read a line until \r\n and return it without the \r\n
 func readLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
@@ -170,4 +244,24 @@ func parseRESP(reader *bufio.Reader) ([]string, error) {
 	}
 
 	return args, nil
+}
+
+func startJanitor() {
+	for {
+		// Sleep for 1 second
+		time.Sleep(1 * time.Second)
+
+		// Wake up and scan for dead keys
+		now := time.Now().Unix()
+
+		store.mu.Lock()
+		for key, exp := range store.expires {
+			if now > exp {
+				delete(store.data, key)
+				delete(store.expires, key)
+				fmt.Printf("Janitor: Cleaned up %s\n", key) // Log to server console
+			}
+		}
+		store.mu.Unlock()
+	}
 }
